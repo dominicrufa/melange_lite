@@ -12,7 +12,4 @@ A short description of the project.
 Copyright (c) 2021, dominic a. rufa
 
 
-#### Acknowledgements
- 
-Project based on the 
-[Computational Molecular Science Python Cookiecutter](https://github.com/molssi/cookiecutter-cms) version 1.5.
+
