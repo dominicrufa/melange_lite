@@ -9,8 +9,7 @@ from __future__ import division, print_function
 from jax import numpy as jnp
 import numpy as np
 from jax.config import config; config.update("jax_enable_x64", True)
-from jax import lax, ops
-from jax_md import quantity
+from jax import lax, ops, vmap, jit, grad, random
 
 
 class SMCSamplerFactory(object):
@@ -75,12 +74,10 @@ class SMCSamplerFactory(object):
         self.T = T
         self.N = N
 
-        self._check_IW_parameters(IW_parameters)
         self.IW_parameters = IW_parameters
 
         #importance weight energy function
-        from melange.md.utils import canonicalize_fn
-        self._IW_energy_fn = jit(vmap(IW_energy_fn, in_axes = (0,None)))
+        self._IW_energy_fn = IW_energy_fn
 
         #handle all of the methods...
         self._handle_methods(**kwargs) #pass all kwargs in hopes the `_handle` function will pick these up
@@ -100,13 +97,6 @@ class SMCSamplerFactory(object):
 
         self._handle_M(**kwargs)
         self._handle_logG(**kwargs)
-
-    def _check_IW_parameters(self, IW_parameters):
-        """helper function...
-        check the importance weight parameters to assert that it is an Array object
-        """
-        from melange.md.utils import Array
-        assert type(IW_parameters) == Array
 
     def _handle_M0_kernel(self, **kwargs):
         """
@@ -151,7 +141,7 @@ class SMCSamplerFactory(object):
         def logG0(X, parameter_dict):
             raise NotImplementedError(f"you have to define the logG0 kernel yourself, dumbass.")
         #set the attrs
-        self.logG0 = jit(logG0)
+        self.logG0 = logG0
 
     def _handle_M(self, M_kernel_fn, M_kernel_energy_fn, M_shift_fn, **kwargs):
         """
@@ -203,7 +193,7 @@ class SMCSamplerFactory(object):
     def build_force_fn(self, energy_fn):
         """make a force_fn
         """
-        force_fn = -1. * grad(energy_fn) #default argnums=0
+        force_fn = lambda x, params: -1. * grad(energy_fn)(x, params) #default argnums=0
         return force_fn
 
 
@@ -224,7 +214,7 @@ class SMCSamplerFactory(object):
             init_lws = self.logG0(init_Xs, parameter_dict)
 
             carrier = (init_Xs, parameter_dict)
-            (out_Xs, _), stacked_lws = lax.scan(run_scan_fn, carrier, jnp.arange(1,self.T))
+            (out_Xs, _), stacked_lws = lax.scan(run_scan_fn, carrier, jnp.arange(0,self.T-1))
             all_lws = jnp.vstack((init_lws[jnp.newaxis, ...], stacked_lws))
             last_lws = jnp.cumsum(all_lws, axis=0)[-1]
             return -last_lws
@@ -242,7 +232,8 @@ class GaussianSMCSamplerFactory(SMCSamplerFactory):
                       M_parameters : Dict,
                             {
                             'mu': Array, # mu array of shape (T, Dx)
-                            'lcov': Array, # log covariance of shape (T, Dx)
+                            'lcov_force': Array, # log covariance of shape (T, Dx)
+                            'lcov_step': Array, # log covarance of shape (T, Dx)
                             }
                       L_parameters : Dict,
                             same as M_parameters
@@ -254,13 +245,11 @@ class GaussianSMCSamplerFactory(SMCSamplerFactory):
         }
 
     """
-    def __init__(self, T, N, IW_energy_fn, IW_parameters, **kwargs):
-        super().__init__(self, *args, **kwargs)
-
-        #define a vmapped unnormalized logp function
-        from melange_lite.utils.gaussians import normalized_Gaussian_logp
-        self._vNormal_logp = vmap(normalized_Gaussian_logp, in_axes = (0, None, None))
-
+    def __init__(self, T, N, IW_parameters, **kwargs):
+        from melange_lite.utils.gaussians import unnormalized_Gaussian_logp
+        energy_fn = lambda x, params: -1. * unnormalized_Gaussian_logp(x, params[0], params[1])
+        super().__init__(T, N, energy_fn, IW_parameters, **kwargs)
+        self._kernel_energy_fn = energy_fn #for the M and l kernels
 
     def _handle_M0_kernel(self, **kwargs):
 
@@ -274,54 +263,81 @@ class GaussianSMCSamplerFactory(SMCSamplerFactory):
             #make xs
             xs = random.normal(x_seed, (self.N, Dx))*jnp.sqrt(cov_vector) + mu
 
-            return {'x': xs, 'seed': x_seed}
-
+            return {'x': xs,
+                    'seed': random.split(x_seed, self.N),
+                    'forward_mu': jnp.repeat(mu[..., jnp.newaxis], self.N, axis=0),
+                    'forward_cov': jnp.repeat(jnp.exp(parameter_dict['lcov'])[..., jnp.newaxis], self.N, axis=0)
+                    }
 
         #set the attrs
-        self.M0 = jit(gaussian_kernel)
+        self.M0 = gaussian_kernel
 
     def _handle_logG0(self, **kwargs):
 
         def logG0(Xs, parameter_dict):
             return jnp.zeros(self.N)
 
-        self.logG0 = jit(logG0)
+        self.logG0 = logG0
 
     def _handle_M(self):
-        def M(X, parameter_dict, t):
-            xs = X['x']
-            params = parameter_dict['M_parameters']
-            mu = params['mu'][t]
-            Dx = len(mu)
-            cov = jnp.exp(params['lcov'][t])
-            forces = -(xs-mu)
-            run_seed, x_seed = random.split(x_seed)
-            new_xs = random.normal(run_seed, (self.N, Dx))*jnp.sqrt(cov) + forces
-            return {'x': new_xs, 'seed': x_seed}
+        from melange_lite.utils.gaussians import EL_mu_sigma, ULA_move
 
-        self.M = M
+        def _M(X, parameter_dict, t):
+            """
+            proposal for a singular particle x
+            """
+            #grab the parameters
+            x = X['x']
+            seed = X['seed']
+            Dx = x.shape
+            ldt = parameter_dict['ldt']
+
+            Mparams = parameter_dict['M_parameters']
+            potential_params = jnp.vstack((Mparams['mu'][t], jnp.exp(Mparams['lcov_force'][t])))
+
+            #split the random seed
+            run_seed, x_seed = random.split(seed)
+
+            #call EL
+            mu, cov = EL_mu_sigma(x, self._kernel_energy_fn, ldt, potential_params)
+
+            #ula move
+            new_x = ULA_move(x, self._kernel_energy_fn, ldt, run_seed, potential_params)
+
+            return {'x': new_x, 'seed': x_seed, 'forward_mu': mu, 'forward_cov': cov}
+
+        self._M = _M #set that attr
+        self.M = vmap(_M,
+                      in_axes=(0, None, None)
+                      )
 
     def _handle_logG(self):
-        def logG(Xp, X, parameter_dict, t):
+        from melange_lite.utils.gaussians import normalized_Gaussian_logp, EL_mu_sigma
+
+        def _logG(Xp, X, parameter_dict, t):
             xp, x = Xp['x'], X['x']
 
-            #compute importance_weight
-            mu_t, mu_tm1 = self.IW_parameters['mu'][t], self.IW_parameters['mu'][t-1]
-            cov_t, cov_tm1 =  jnp.exp(self.IW_parameters['lcov'][t]), jnp.exp(self.IW_parameters['lcov'][t])
+            #compute importance_weight (there is 1 more index in the IW parameters than in everything else...)
+            mu_t, mu_tm1 = self.IW_parameters['mu'][t+1], self.IW_parameters['mu'][t]
+            cov_force_t, cov_force_tm1 =  jnp.exp(self.IW_parameters['lcov_force'][t+1]), jnp.exp(self.IW_parameters['lcov_force'][t])
 
-            IWs = -self._IW_energy_fn(x, jnp.vstack((mu_t, cov_t))) + self._IW_energy_fn(xp, jnp.vstack((mu_tm1, cov_tm1)))
+            IWs = -self._IW_energy_fn(x, jnp.vstack((mu_t, cov_force_t))) + self._IW_energy_fn(xp, jnp.vstack((mu_tm1, cov_force_tm1)))
 
-            #compute M_kernel_logp
-            Mparams = parameter_dict['M_parameters']
-            k_t_logps = self._vNormal_logp(x, -(xp - Mparams['mu'][t]), jnp.exp(Mparams['lcov'][t]))
+            #compute M_kernel_logp: we don't need to recompute this
+            k_t_logps = normalized_Gaussian_logp(x, X['forward_mu'], X['forward_cov'])
+
 
             #compute l_kernel_logp
             Lparams = parameter_dict['L_parameters']
-            l_tm1_logps = self._vNormal_logp(xp, -(x - Lparams['mu'][t]), jnp.exp(Lparams['lcov'][t]))
-
+            potential_params = jnp.vstack((Lparams['mu'][t], jnp.exp(Lparams['lcov_force'][t])))
+            l_mu, l_cov = EL_mu_sigma(x, self._kernel_energy_fn, parameter_dict['ldt'], potential_params)
+            l_tm1_logps = normalized_Gaussian_logp(xp, l_mu, l_cov)
 
             #finalize and return
             lws = IWs + l_tm1_logps - k_t_logps
             return lws
 
-        self.logG = logG
+        self._logG = _logG
+        self.logG = vmap(_logG, in_axes=(0, 0, None, None))
+
+class IsingsModelSMCSampler()
