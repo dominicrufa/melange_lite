@@ -216,8 +216,8 @@ class SMCSamplerFactory(object):
             carrier = (init_Xs, parameter_dict)
             (out_Xs, _), stacked_lws = lax.scan(run_scan_fn, carrier, jnp.arange(0,self.T-1))
             all_lws = jnp.vstack((init_lws[jnp.newaxis, ...], stacked_lws))
-            last_lws = jnp.cumsum(all_lws, axis=0)[-1]
-            return -last_lws
+            #last_lws = jnp.cumsum(all_lws, axis=0)[-1]
+            return -all_lws
         return works_fn
 
 class GaussianSMCSamplerFactory(SMCSamplerFactory):
@@ -231,17 +231,22 @@ class GaussianSMCSamplerFactory(SMCSamplerFactory):
                       seed : Array, # jax.random.PRNGKey
                       M_parameters : Dict,
                             {
-                            'mu': Array, # mu array of shape (T, Dx)
-                            'lcov_force': Array, # log covariance of shape (T, Dx)
-                            'lcov_step': Array, # log covarance of shape (T, Dx)
+                            'mu': Array, # mu array of shape (T-1, Dx)
+                            'lcov_force': Array, # log covariance of shape (T-1, Dx)
+                            'lcov_step': Array, # log covarance of shape (T-1, Dx)
                             }
                       L_parameters : Dict,
                             same as M_parameters
+                      ldt : Array # float of the log timestep
                      }
 
     X = {
          x : Array, # positions of shape (N,Dx)
-         seed : Array, # jax.random.PRNGKey of shape (N)
+         seed : Array, # jax.random.PRNGKey of shape (N),
+
+         # the following parameters are added so that the k_logp kernel calculator doesn't have to recompute the M push values
+         'forward_mu' : Array #forward mu of the ULA process
+         'forward_cov' : Array #forward mu of the ULA process
         }
 
     """
@@ -339,5 +344,3 @@ class GaussianSMCSamplerFactory(SMCSamplerFactory):
 
         self._logG = _logG
         self.logG = vmap(_logG, in_axes=(0, 0, None, None))
-
-class IsingsModelSMCSampler()
